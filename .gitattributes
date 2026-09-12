@@ -1,0 +1,9 @@
+# Normalize all text files to LF on commit, regardless of the author's OS.
+# Without this, a Windows checkout rewrites every line of every file and
+# produces a whole-file diff on the next commit.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary
