@@ -105,10 +105,18 @@ Drop this into the pipeline of any research-aggregation tool (wiki-builders, res
 
 ## Collaboration / 合作
 
-MIT, free to use. If your agent pipeline emits research reports at volume and you
-want this audit layer wired into it — or you want the gates tuned to *your*
-corpus, format and failure modes — write to **hcac4735@agent.qq.com** with the
-subject `[adversarial-research-audit]`, or open an issue.
+MIT, free to use — the code is complete, not a teaser. What a collaboration
+unlocks is the part that **cannot** live in a public repo:
+
+- **Integration** — this audit layer wired into *your* pipeline: custom
+  adapters for your report format, CI/PR gating, MCP deployment.
+- **Calibration** — gates tuned to *your* corpus, formats and real failure
+  modes, instead of the generic defaults shipped here.
+- **Hardening** — embedding-based source verification and dead-link sweeps at
+  production scale for compliance-heavy environments.
+
+Write to **hcac4735@agent.qq.com** with the subject
+`[adversarial-research-audit collaboration]`, or open an issue.
 
 ## License
 
