@@ -19,3 +19,12 @@
 | PATCH-008 | P1 | 架构师 | 无法接入真实研究工具，"works with" 只是口号 | 缺适配层 | 新增 `adapters/llm_wiki.py`：按 nashsu/llm_wiki(18.9k★) 真实契约解析 wiki/ + frontmatter `sources[]` + `[[wikilink]]` | tests/test_adapter.py 5 用例 + `examples/llm-wiki-demo` 实跑 FAIL 5/6 ✅ | closed |
 | PATCH-009 | P1 | 审计员 | 引用完整性无闸门：幽灵引用/悬空链接不影响判定 | 只有 5 关 | 新增 gate6（输入带 `integrity` 才启用，向后兼容 5 关制） | 干净项目 PASS 6/6；缺陷项目 FAIL 且 gate6 点名 ✅ | closed |
 | PATCH-010 | P2 | 极简主义者 | adapter 首版把"未编译源"算进覆盖率导致 examined>total 自相矛盾 | 审计单元混淆（页 vs 源） | 覆盖率单元统一为 wiki 页；未编译源降级为 gate6 备注 | 21/21 测试 ✅ | closed |
+
+## 第三轮（发布前检测流程，2026-09-12 下午）
+
+| ID | 优先级 | 身份 | 问题 | 根因 | 变更 | 验证 | 状态 |
+|----|--------|------|------|------|------|------|------|
+| PATCH-011 | P1 | SRE | 文件以 **CRLF** 入库（编写机为 Windows），他人 clone 后会被整文件重写、产生全文件 diff，diff 历史失真 | 缺 `.gitattributes` | 新增 `.gitattributes`（`* text=auto eol=lf`）+ `git add --renormalize .` 重写 blob | 线上 blob 经 API 直读复核 **CR 行数 = 0** ✅ | closed |
+| PATCH-012 | P1 | 测试工程师 | CI 只验退出码，不验 JSON 输出契约（verdict 合法值、gate 数量、5 关制向后兼容），契约回归无保护 | 断言过薄 | CI 增 JSON contract 步骤 | 本地 CI 全步骤复现通过 ✅ | closed |
+| PATCH-013 | P2 | 商业 | 无求合作入口，与既有发布惯例不一致 → 流量来了没有转化出口 | 缺 | README 增 `Collaboration / 合作` 段（统一对外邮箱） | 人工复核 ✅ | closed |
+| PATCH-014 | P3 | 维护者 | 缺 SECURITY.md / CONTRIBUTING.md（PATCH-005 遗留） | 范围控制 | 未做——发布后首个社区 PR 前补齐 | — | open |

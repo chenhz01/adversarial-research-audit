@@ -103,6 +103,13 @@ A failed report can't be patched with a disclaimer — conclusions drawn from a 
 
 Drop this into the pipeline of any research-aggregation tool (wiki-builders, research agents, report generators) as the last step before persistence. If your tool emits structured reports, writing an `audit-input-v1` adapter is ~20 lines.
 
+## Collaboration / 合作
+
+MIT, free to use. If your agent pipeline emits research reports at volume and you
+want this audit layer wired into it — or you want the gates tuned to *your*
+corpus, format and failure modes — write to **hcac4735@agent.qq.com** with the
+subject `[adversarial-research-audit]`, or open an issue.
+
 ## License
 
 MIT
