@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# generated audit output
+out.json
+*.cache.json
+.vcache*.json

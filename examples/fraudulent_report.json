@@ -1,0 +1,15 @@
+{
+  "title": "Audit of 260 browser extensions (FRAUDULENT SAMPLE)",
+  "source_of_set": { "method": "html-page", "description": "Editor's picks page" },
+  "coverage": { "examined": 11, "total": 260 },
+  "clusters": [
+    { "name": "ad-blockers", "count": 6 },
+    { "name": "password-managers", "count": 4 }
+  ],
+  "claims": [
+    { "id": "c1", "text": "Extension X requests host permissions on all sites",
+      "sources": [ { "name": "official docs", "url": "https://example.com/docs" } ] },
+    { "id": "c2", "text": "Extension Y has 2M users",
+      "sources": [] }
+  ]
+}

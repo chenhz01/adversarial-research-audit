@@ -1,0 +1,25 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m unittest discover tests -v
+      - run: python audit.py examples/clean_report.json
+      - name: fraudulent report must fail
+        run: python audit.py examples/fraudulent_report.json && exit 1 || test $? -eq 1
+      - name: llm-wiki demo must fail on integrity
+        run: python adapters/llm_wiki.py examples/llm-wiki-demo --audit && exit 1 || test $? -eq 1
+      - name: JSON envelope contract
+        run: |
+          python audit.py examples/clean_report.json --json out.json --quiet
+          python -c "
+          import json
+          d = json.load(open('out.json', encoding='utf-8'))
+          o = d['outputs']
+          assert o['verdict'] in ('PASS', 'PASS-WITH-CAVEAT'), o['verdict']
+          assert len(o['gates']) == 5, len(o['gates'])   # no integrity section -> 5-gate legacy mode
+          print('json contract OK:', o['verdict'], len(o['gates']), 'gates')"

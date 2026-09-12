@@ -1,0 +1,22 @@
+{
+  "title": "Audit of 260 browser extensions (clean sample)",
+  "source_of_set": { "method": "api", "description": "WebExtensions API export, 2026-09-12" },
+  "coverage": { "examined": 12, "total": 12 },
+  "clusters": [
+    { "name": "ad-blockers", "count": 7 },
+    { "name": "password-managers", "count": 5 }
+  ],
+  "claims": [
+    { "id": "c1", "count": 7, "text": "7/7 ad-blocker extensions in the set publish source; spot-checks confirmed manifests match store listings",
+      "sources": [
+        { "name": "official docs", "url": "https://example.com/docs" },
+        { "name": "repo manifest", "url": "https://example.com/manifest" }
+      ] },
+    { "id": "c2", "count": 5, "text": "5/5 password-manager extensions pass the permission audit",
+      "sources": [
+        { "name": "repo", "url": "https://example.com/repo" },
+        { "name": "docs page", "url": "https://example.com/docs" }
+      ] }
+  ],
+  "unjudged": []
+}

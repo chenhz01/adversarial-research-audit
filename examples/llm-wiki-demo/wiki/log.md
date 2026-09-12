@@ -1,0 +1,2 @@
+- 2026-09-12 ingest karpathy-gist.md
+- 2026-09-12 ingest rag-paper.md
