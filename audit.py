@@ -16,7 +16,7 @@ import sys
 import uuid
 
 ENGINE = "adversarial-research-audit"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------- gates
@@ -266,14 +266,19 @@ def collect_urls(report: dict) -> list:
 
 
 def verify_sources(report: dict, offline: bool = False,
-                   cache_path: str | None = None) -> tuple[dict, bool]:
+                   cache_path: str | None = None,
+                   allow_private_networks: bool = True) -> tuple[dict, bool]:
     """Run the source verifier over claim URLs. Returns (integrity_blob, degraded)."""
     from verify import SourceVerifier
 
     urls = collect_urls(report)
     if not urls:
         return {"note": "no http(s) source URLs to verify"}, False
-    v = SourceVerifier(cache_path=cache_path, offline=offline)
+    v = SourceVerifier(
+        cache_path=cache_path,
+        offline=offline,
+        allow_private_networks=allow_private_networks,
+    )
     results = v.verify_many(urls)
     s = v.summary(results)
     dead = [r["url"] for r in results if r.get("ok") is False]

@@ -19,8 +19,10 @@ Zero dependencies (stdlib urllib). Usable as a library or as a CLI:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -46,19 +48,68 @@ def _is_loopback(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".localhost")
 
 
-def _build_opener(url: str, proxy: str | None) -> urllib.request.OpenerDirector:
+def _build_opener(
+    url: str,
+    proxy: str | None,
+    redirect_handler: urllib.request.HTTPRedirectHandler | None = None,
+) -> urllib.request.OpenerDirector:
     """Loopback must never go through an egress proxy — otherwise a sandbox or
     corporate proxy turns every localhost check into a 502 and we would report
     live sources as dead."""
+    handlers: list[urllib.request.BaseHandler] = []
     if proxy:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    if _is_loopback(url):
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
-    if no_proxy and any(h.strip() and h.strip() in url for h in no_proxy.split(",")):
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener()
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    elif _is_loopback(url):
+        handlers.append(urllib.request.ProxyHandler({}))
+    else:
+        no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
+        if no_proxy and any(h.strip() and h.strip() in url for h in no_proxy.split(",")):
+            handlers.append(urllib.request.ProxyHandler({}))
+    if redirect_handler is not None:
+        handlers.append(redirect_handler)
+    return urllib.request.build_opener(*handlers)
+
+
+def _address_policy_error(url: str) -> str | None:
+    """Return an error when a URL resolves outside the public Internet."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "invalid-url"
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return "unsupported-scheme"
+    host = parsed.hostname
+    if not host:
+        return "invalid-url"
+
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            infos = socket.getaddrinfo(host, port,
+                                       type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise urllib.error.URLError(f"dns-resolution-failed: {exc}") from exc
+        addresses = []
+        for info in infos:
+            sockaddr = info[4]
+            if sockaddr:
+                addresses.append(ipaddress.ip_address(sockaddr[0]))
+
+    if not addresses:
+        raise urllib.error.URLError("dns-resolution-returned-no-addresses")
+    if any(not address.is_global for address in addresses):
+        return "blocked-private-address"
+    return None
+
+
+class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        error = _address_policy_error(newurl)
+        if error:
+            raise urllib.error.URLError(error)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class SourceVerifier:
@@ -69,11 +120,13 @@ class SourceVerifier:
                  timeout: int = DEFAULT_TIMEOUT,
                  max_bytes: int = DEFAULT_MAX_BYTES,
                  offline: bool = False,
-                 proxy: Optional[str] = None):
+                 proxy: Optional[str] = None,
+                 allow_private_networks: bool = True):
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.offline = offline
         self.proxy = proxy
+        self.allow_private_networks = allow_private_networks
         self.cache_path = Path(cache_path) if cache_path else None
         self.cache: Dict[str, dict] = {}
         if self.cache_path and self.cache_path.exists():
@@ -115,8 +168,13 @@ class SourceVerifier:
 
     # ---- internals --------------------------------------------------------
 
+    def _redirect_handler(self) -> urllib.request.HTTPRedirectHandler:
+        if self.allow_private_networks:
+            return urllib.request.HTTPRedirectHandler()
+        return _PolicyRedirectHandler()
+
     def _request(self, req: urllib.request.Request, read_body: bool) -> tuple:
-        opener = _build_opener(req.full_url, self.proxy)
+        opener = _build_opener(req.full_url, self.proxy, self._redirect_handler())
         with opener.open(req, timeout=self.timeout) as resp:
             body = resp.read(self.max_bytes) if read_body else b""
             return resp.status, dict(resp.headers), body
@@ -130,6 +188,17 @@ class SourceVerifier:
         if not url.lower().startswith(("http://", "https://")):
             out["error"] = "unsupported-scheme"
             return out
+        if not self.allow_private_networks:
+            try:
+                policy_error = _address_policy_error(url)
+            except urllib.error.URLError as exc:
+                out["ok"] = None
+                out["error"] = f"network-unavailable: {getattr(exc, 'reason', exc)}"
+                return out
+            if policy_error:
+                out["ok"] = None
+                out["error"] = policy_error
+                return out
         head = urllib.request.Request(url, method="HEAD",
                                       headers={"User-Agent": USER_AGENT})
         try:
@@ -155,7 +224,8 @@ class SourceVerifier:
         except urllib.error.URLError as e:
             # network failure ≠ dead source. Honest semantics: unknown.
             out["ok"] = None
-            out["error"] = f"network-unavailable: {getattr(e, 'reason', e)}"
+            reason = str(getattr(e, "reason", e))
+            out["error"] = reason if reason == "blocked-private-address" else f"network-unavailable: {reason}"
             return out
         except Exception as e:  # timeout, ssl, redirect loops …
             out["ok"] = None
@@ -170,8 +240,16 @@ class SourceVerifier:
             out["ok"] = status < 400
             out["bytes"] = len(body)
             out["sha256"] = hashlib.sha256(body).hexdigest()
+        except urllib.error.HTTPError as e:
+            out["status_code"] = e.code
+            if e.code in PROXY_ERROR_CODES:
+                out["ok"] = None
+            else:
+                out["ok"] = False
+            out["error"] = f"body-fetch-failed: HTTPError: {e}"
         except Exception as e:
-            # HEAD said it exists but the body failed: exists, unverifiable content
+            # HEAD alone proves existence, not that the source could be verified.
+            out["ok"] = None
             out["error"] = f"body-fetch-failed: {type(e).__name__}: {e}"
         return out
     def summary(self, results: List[dict]) -> dict:

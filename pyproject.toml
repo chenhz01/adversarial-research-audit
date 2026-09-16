@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adversarial-research-audit"
+version = "1.1.0"
+description = "Adversarial coverage and evidence-hygiene audit for agentic research"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "chenhz01" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/chenhz01/adversarial-research-audit"
+Repository = "https://github.com/chenhz01/adversarial-research-audit"
+
+[project.scripts]
+adversarial-research-audit-mcp = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["audit", "mcp_server", "verify"]

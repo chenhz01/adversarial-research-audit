@@ -6,10 +6,13 @@ import functools
 import hashlib
 import http.server
 import socketserver
+import urllib.error
+import urllib.request
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,6 +159,44 @@ class TestProxyHonesty(unittest.TestCase):
                     srv.close()
         finally:
             os.environ.pop("HTTP_PROXY", None)
+
+
+class TestMcpNetworkPolicy(unittest.TestCase):
+    def test_private_literal_is_unknown_when_private_networks_are_blocked(self):
+        result = SourceVerifier(allow_private_networks=False).verify("http://127.0.0.1/private")
+        self.assertIsNone(result["ok"])
+        self.assertEqual(result["error"], "blocked-private-address")
+
+    def test_private_dns_result_is_unknown(self):
+        with mock.patch(
+            "verify.socket.getaddrinfo",
+            return_value=[(None, None, None, None, ("10.0.0.2", 80))],
+        ):
+            result = SourceVerifier(allow_private_networks=False).verify("http://internal.example/a")
+        self.assertIsNone(result["ok"])
+        self.assertEqual(result["error"], "blocked-private-address")
+
+    def test_redirect_target_is_revalidated(self):
+        verifier = SourceVerifier(allow_private_networks=False)
+        handler = verifier._redirect_handler()
+        request = urllib.request.Request("https://public.example/start")
+        with mock.patch(
+            "verify.socket.getaddrinfo",
+            return_value=[(None, None, None, None, ("127.0.0.1", 80))],
+        ):
+            with self.assertRaises(urllib.error.URLError):
+                handler.redirect_request(request, None, 302, "Found", {}, "http://localhost/admin")
+
+    def test_body_transport_failure_is_unknown(self):
+        verifier = SourceVerifier()
+        with mock.patch.object(
+            verifier,
+            "_request",
+            side_effect=[(200, {}, b""), urllib.error.URLError("offline")],
+        ):
+            result = verifier.verify("https://example.com/source", use_cache=False)
+        self.assertIsNone(result["ok"])
+        self.assertIn("body-fetch-failed", result["error"])
 
 
 if __name__ == "__main__":
