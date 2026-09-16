@@ -81,15 +81,39 @@ Expose the auditor to any MCP-compatible agent host:
 ```json
 {
   "mcpServers": {
-    "adversarial-research-audit": {
-      "command": "python",
-      "args": ["/path/to/mcp_server.py"]
+    "research_audit": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/chenhz01/adversarial-research-audit.git@<commit-sha>",
+        "adversarial-research-audit-mcp"
+      ]
     }
   }
 }
 ```
 
-The host gets one tool, `audit_report`: pass the report JSON, receive the verdict. `tools/call` returns `isError: true` for `FAIL` verdicts so agents can react.
+Replace `<commit-sha>` with a reviewed immutable revision. For local development,
+`uvx --from /path/to/adversarial-research-audit adversarial-research-audit-mcp`
+uses the checkout directly.
+
+The host gets one tool, `audit_report`: pass the `audit-input-v1` report JSON and
+receive the complete `audit-output-v1` envelope in both text and MCP
+`structuredContent`. A report verdict of `FAIL` is a successful tool call whose
+`outputs.verdict` is `FAIL`; MCP `isError` is reserved for invalid arguments or
+execution failures.
+
+Set `verify_sources: true` in the tool arguments to fetch public HTTP(S) claim
+sources and arm gate 6. Transport failures remain `unknown` and set
+`degraded: true`; they are never counted as dead links. MCP source verification
+blocks loopback, private, link-local, reserved, and other non-public addresses,
+including redirect targets. Operators who intentionally audit trusted intranet
+URLs may set `ADVERSARIAL_RESEARCH_AUDIT_ALLOW_PRIVATE_NETWORKS=1` in the MCP
+server environment. This opt-in permits server-side requests to private
+networks and should not be enabled for untrusted report inputs.
+
+The MCP input is capped at 1,000,000 JSON characters. `verify_sources` defaults
+to `false`, so enabling the server alone performs no outbound requests.
 
 ### Pipeline integration
 

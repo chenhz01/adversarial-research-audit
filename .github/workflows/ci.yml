@@ -7,6 +7,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - run: python -m pip install .
+      - name: Packaged MCP entry point
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | adversarial-research-audit-mcp \
+            | python -c "import json,sys; d=json.load(sys.stdin); assert d['result']['tools'][0]['name']=='audit_report'"
       - run: python -m unittest discover tests -v
       - run: python audit.py examples/clean_report.json
       - name: fraudulent report must fail

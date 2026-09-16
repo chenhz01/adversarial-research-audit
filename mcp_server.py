@@ -22,7 +22,9 @@ protocols/audit-protocol.md) and returns the audit envelope (audit-output-v1).
 """
 from __future__ import annotations
 
+import copy
 import json
+import os
 import sys
 
 import audit  # same directory
@@ -49,14 +51,43 @@ TOOLS = [
                     "type": "string",
                     "description": "Alternative: the report as a JSON string",
                 },
+                "verify_sources": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Verify public HTTP(S) claim sources and arm integrity gate 6",
+                },
             },
             "anyOf": [{"required": ["report"]}, {"required": ["raw"]}],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "required": ["engine", "version", "inputs", "outputs", "confidence", "degraded", "trace_id"],
+            "properties": {
+                "engine": {"type": "string"},
+                "version": {"type": "string"},
+                "inputs": {"type": "object"},
+                "outputs": {"type": "object"},
+                "confidence": {"type": "number"},
+                "degraded": {"type": "boolean"},
+                "trace_id": {"type": "string"},
+            },
         },
     }
 ]
 
 
 MAX_RAW_CHARS = 1_000_000  # red-team finding PATCH-002: cap input to prevent DoS
+
+
+def _invalid_params(msg_id: object, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32602, "message": message}}
+
+
+def _allow_private_networks() -> bool:
+    value = os.environ.get("ADVERSARIAL_RESEARCH_AUDIT_ALLOW_PRIVATE_NETWORKS", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def handle(msg: dict, state: dict) -> dict | None:
@@ -84,19 +115,50 @@ def handle(msg: dict, state: dict) -> dict | None:
             return {"jsonrpc": "2.0", "id": msg_id,
                     "error": {"code": -32602, "message": f"unknown tool {params.get('name')!r}"}}
         args = params.get("arguments") or {}
+        if not isinstance(args, dict):
+            return _invalid_params(msg_id, "arguments must be an object")
         report = args.get("report")
         if report is None:
-            raw = args.get("raw") or ""
+            if "raw" not in args:
+                return _invalid_params(msg_id, "one of report or raw is required")
+            raw = args.get("raw")
+            if not isinstance(raw, str):
+                return _invalid_params(msg_id, "raw must be a string")
             if len(raw) > MAX_RAW_CHARS:
-                return {"jsonrpc": "2.0", "id": msg_id,
-                        "error": {"code": -32602,
-                                  "message": f"raw too large ({len(raw)} chars, max {MAX_RAW_CHARS})"}}
+                return _invalid_params(msg_id,
+                                       f"raw too large ({len(raw)} chars, max {MAX_RAW_CHARS})")
             try:
-                report = json.loads(raw or "{}")
+                report = json.loads(raw)
             except json.JSONDecodeError as exc:
-                return {"jsonrpc": "2.0", "id": msg_id,
-                        "error": {"code": -32602, "message": f"raw is not JSON: {exc}"}}
+                return _invalid_params(msg_id, f"raw is not JSON: {exc}")
+        try:
+            report_size = len(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError) as exc:
+            return _invalid_params(msg_id, f"report is not JSON-compatible: {exc}")
+        if report_size > MAX_RAW_CHARS:
+            return _invalid_params(msg_id,
+                                   f"report too large ({report_size} chars, max {MAX_RAW_CHARS})")
+
+        verify_requested = args.get("verify_sources", False)
+        if not isinstance(verify_requested, bool):
+            return _invalid_params(msg_id, "verify_sources must be a boolean")
+        report = copy.deepcopy(report)
+        verification_degraded = False
+        if verify_requested:
+            if not isinstance(report, dict):
+                return _invalid_params(msg_id, "source verification requires report to be an object")
+            integrity, verification_degraded = audit.verify_sources(
+                report,
+                allow_private_networks=_allow_private_networks(),
+            )
+            existing_integrity = report.get("integrity")
+            if not isinstance(existing_integrity, dict):
+                existing_integrity = {}
+                report["integrity"] = existing_integrity
+            existing_integrity.update(integrity)
         envelope = audit.audit(report)
+        if verification_degraded:
+            envelope["degraded"] = True
         text = audit.render_text(envelope)
         return {
             "jsonrpc": "2.0",
@@ -106,7 +168,8 @@ def handle(msg: dict, state: dict) -> dict | None:
                     {"type": "text", "text": text},
                     {"type": "text", "text": json.dumps(envelope, ensure_ascii=False)},
                 ],
-                "isError": envelope.get("outputs", {}).get("verdict") == "FAIL",
+                "structuredContent": envelope,
+                "isError": False,
             },
         }
     if msg_id is not None:
