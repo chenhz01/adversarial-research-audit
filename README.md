@@ -48,7 +48,7 @@ python adapters/llm_wiki.py /path/to/my-wiki --json out.json
 
 Shipped demo: `examples/llm-wiki-demo/` contains a deliberate ghost citation and a dangling link — run the command above against it to see gate 6 fire.
 
-> **Honest boundary**: this tool audits *coverage arithmetic and evidence hygiene*. It does **not** verify that a cited source actually exists or says what the report claims — source authenticity is out of scope (see `protocols/audit-protocol.md` → Non-goals).
+> **Honest boundary**: this tool audits *coverage arithmetic and evidence hygiene* — including whether cited sources **exist** (via `verify.py`: HTTP status + content SHA-256; mirrors are never double-counted as independent). It does **not** establish *source independence* between two verified sources, nor whether the cited content actually **supports** the claim it is attached to — content fact-checking is out of scope (see `protocols/audit-protocol.md` → Non-goals). A passing audit is evidence hygiene, not factual verification of the report's claims.
 
 ## The one-line pitch
 
