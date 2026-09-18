@@ -12,13 +12,26 @@ Offline by default: if the network is unavailable the verifier returns
 `ok=None / error=network-unavailable` and the audit marks itself `degraded`
 rather than pretending the source is fine.
 
+Transport safety (DNS-rebinding hardened): every hostname is resolved once,
+validated against the transport policy (restricted by default — only global
+public addresses are connectable), and the socket dials the validated address
+directly. SNI/TLS verification and the Host header keep using the original
+hostname. The pin is shared by HEAD, GET and same-host redirect hops, and
+every cross-host redirect hop is re-resolved and re-validated. Callers that
+legitimately need loopback/private targets must pass
+`allow_private_networks=True` explicitly — the restricted default never
+inherits silently.
+
 Zero dependencies (stdlib urllib). Usable as a library or as a CLI:
 
     python verify.py https://example.com/a https://example.com/b
 """
 from __future__ import annotations
 
+import errno
+import functools
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -28,8 +41,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_TIMEOUT = 10
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MB cap for hashing
@@ -40,6 +54,132 @@ USER_AGENT = "adversarial-research-audit/1.1 (+source authenticity check)"
 PROXY_ERROR_CODES = {407, 502, 503, 504}
 
 
+@dataclass
+class TransportPolicy:
+    """Connection-safety policy for outbound source verification.
+
+    allow_private_networks=False (restricted, fail-closed) rejects any URL whose
+    DNS records resolve exclusively to non-public addresses (loopback, RFC1918,
+    link-local, CGNAT, documentation, multicast, reserved, IPv4-mapped IPv6).
+    The restricted default is deliberate: callers that legitimately need
+    loopback/private targets must pass allow_private_networks=True explicitly,
+    never inherit it silently.
+    """
+
+    allow_private_networks: bool = False
+    pin_ttl: float = 30.0  # seconds a validated (host, port) -> IP pin stays fresh
+
+
+class _PolicyBlocked(urllib.error.URLError):
+    """Raised when DNS records fail the transport policy (definite, not unknown)."""
+
+
+def _addr_allowed(ip: ipaddress.IPAddress, allow_private_networks: bool) -> bool:
+    # Unwrap IPv4-mapped IPv6 (::ffff:10.0.0.1 must be judged as 10.0.0.1)
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        # CPython 3.13+ marks some multicast/reserved ranges is_global=True;
+        # deny them explicitly so the docstring contract holds.
+        return allow_private_networks
+    return bool(ip.is_global) or allow_private_networks
+
+
+def _resolve_pinned(hostname: str, port: int,
+                    allow_private_networks: bool) -> str:
+    """Resolve hostname once and return ONE validated public IP to connect to.
+
+    The caller connects to the returned address directly (SNI/Host still carry
+    the original hostname), so a DNS rebinding flip between validation and
+    connection cannot redirect the socket. Mixed records: non-public entries
+    are dropped, never connected to.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise urllib.error.URLError(f"dns-resolution-failed: {e}") from e
+    seen: List[ipaddress.IPAddress] = []
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if addr not in seen:
+            seen.append(addr)
+    if not seen:
+        raise urllib.error.URLError(f"dns-resolution-empty: {hostname}")
+    allowed = [a for a in seen if _addr_allowed(a, allow_private_networks)]
+    if not allowed:
+        raise _PolicyBlocked(
+            "policy-blocked: " + hostname + " resolves only to non-public "
+            "address(es) (" + ", ".join(str(a) for a in seen) + ")")
+    return str(allowed[0])
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection that dials the validated IP, never a fresh DNS lookup."""
+
+    def __init__(self, *args, validated_ip: Optional[str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validated_ip = validated_ip
+
+    def connect(self):
+        target = self._validated_ip or self.host
+        sys.audit("http.client.connect", self, target, self.port)
+        self.sock = socket.create_connection(
+            (target, self.port), self.timeout, self.source_address)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that dials the validated IP; SNI/cert-check keep using
+    the original hostname so TLS verification semantics are unchanged."""
+
+    def __init__(self, *args, validated_ip: Optional[str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validated_ip = validated_ip
+
+    def connect(self):
+        target = self._validated_ip or self.host
+        sys.audit("http.client.connect", self, target, self.port)
+        self.sock = socket.create_connection(
+            (target, self.port), self.timeout, self.source_address)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
+        server_hostname = self.host  # original hostname, not the pinned IP
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=server_hostname)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, pin_fn, context=None):
+        super().__init__()
+        self._pin_fn = pin_fn
+
+    def http_open(self, req):
+        ip = self._pin_fn(req, "http")
+        conn = functools.partial(_PinnedHTTPConnection, validated_ip=ip)
+        return self.do_open(conn, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pin_fn, context=None):
+        super().__init__(context=context)
+        self._pin_fn = pin_fn
+
+    def https_open(self, req):
+        ip = self._pin_fn(req, "https")
+        conn = functools.partial(_PinnedHTTPSConnection, validated_ip=ip)
+        return self.do_open(conn, req, context=self._context)
+
+
 def _is_loopback(url: str) -> bool:
     try:
         host = urllib.parse.urlsplit(url).hostname or ""
@@ -48,68 +188,31 @@ def _is_loopback(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".localhost")
 
 
-def _build_opener(
-    url: str,
-    proxy: str | None,
-    redirect_handler: urllib.request.HTTPRedirectHandler | None = None,
-) -> urllib.request.OpenerDirector:
-    """Loopback must never go through an egress proxy — otherwise a sandbox or
-    corporate proxy turns every localhost check into a 502 and we would report
-    live sources as dead."""
-    handlers: list[urllib.request.BaseHandler] = []
+def _build_opener(url: str, proxy: str | None,
+                  http_handler, https_handler) -> urllib.request.OpenerDirector:
+    """Build the opener for one request.
+
+    Direct (proxy-free) connections go through the pinned handlers: DNS is
+    resolved+validated once, and the socket dials the validated address only.
+    When an explicit proxy is configured, or environment proxies apply to the
+    URL, DNS belongs to the proxy — pinning is skipped there by design.
+    Loopback and NO_PROXY-matched URLs never traverse an egress proxy (see
+    the loopback rule below).
+    """
     if proxy:
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    elif _is_loopback(url):
-        handlers.append(urllib.request.ProxyHandler({}))
-    else:
-        no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
-        if no_proxy and any(h.strip() and h.strip() in url for h in no_proxy.split(",")):
-            handlers.append(urllib.request.ProxyHandler({}))
-    if redirect_handler is not None:
-        handlers.append(redirect_handler)
-    return urllib.request.build_opener(*handlers)
-
-
-def _address_policy_error(url: str) -> str | None:
-    """Return an error when a URL resolves outside the public Internet."""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-    except ValueError:
-        return "invalid-url"
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return "unsupported-scheme"
-    host = parsed.hostname
-    if not host:
-        return "invalid-url"
-
-    try:
-        addresses = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            infos = socket.getaddrinfo(host, port,
-                                       type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise urllib.error.URLError(f"dns-resolution-failed: {exc}") from exc
-        addresses = []
-        for info in infos:
-            sockaddr = info[4]
-            if sockaddr:
-                addresses.append(ipaddress.ip_address(sockaddr[0]))
-
-    if not addresses:
-        raise urllib.error.URLError("dns-resolution-returned-no-addresses")
-    if any(not address.is_global for address in addresses):
-        return "blocked-private-address"
-    return None
-
-
-class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        error = _address_policy_error(newurl)
-        if error:
-            raise urllib.error.URLError(error)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if _is_loopback(url):
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), http_handler, https_handler)
+    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
+    if no_proxy and any(h.strip() and h.strip() in url for h in no_proxy.split(",")):
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), http_handler, https_handler)
+    if urllib.request.getproxies():
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), http_handler, https_handler)
 
 
 class SourceVerifier:
@@ -121,12 +224,20 @@ class SourceVerifier:
                  max_bytes: int = DEFAULT_MAX_BYTES,
                  offline: bool = False,
                  proxy: Optional[str] = None,
-                 allow_private_networks: bool = True):
+                 allow_private_networks: bool = False,
+                 pin_ttl: float = 30.0):
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.offline = offline
         self.proxy = proxy
-        self.allow_private_networks = allow_private_networks
+        self.policy = TransportPolicy(allow_private_networks=allow_private_networks,
+                                      pin_ttl=pin_ttl)
+        # Validated-address pins: (scheme, host, port) -> (ip, monotonic ts).
+        # Shared by HEAD and GET (and same-host redirect hops) so a DNS flip
+        # between requests cannot re-point the socket inside one verify() call.
+        self._pins: Dict[Tuple[str, str, int], Tuple[str, float]] = {}
+        self._http_handler = _PinnedHTTPHandler(self._pin_for_request)
+        self._https_handler = _PinnedHTTPSHandler(self._pin_for_request)
         self.cache_path = Path(cache_path) if cache_path else None
         self.cache: Dict[str, dict] = {}
         if self.cache_path and self.cache_path.exists():
@@ -134,6 +245,29 @@ class SourceVerifier:
                 self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 self.cache = {}
+
+    # ---- transport policy --------------------------------------------------
+
+    def _pin_for_request(self, req: urllib.request.Request, scheme: str) -> str:
+        """Return the validated IP for this request, from cache when fresh."""
+        try:
+            u = urllib.parse.urlsplit(req.full_url)
+        except ValueError as e:
+            raise urllib.error.URLError(f"invalid-url: {e}") from e
+        hostname = u.hostname
+        if not hostname:
+            raise urllib.error.URLError("no host given")
+        port = u.port or (443 if scheme == "https" else 80)
+        key = (scheme, hostname, port)
+        now = time.monotonic()
+        cached = self._pins.get(key)
+        if cached and (now - cached[1]) < self.policy.pin_ttl:
+            return cached[0]
+        ip = _resolve_pinned(hostname, port, self.policy.allow_private_networks)
+        if len(self._pins) > 256:
+            self._pins.clear()
+        self._pins[key] = (ip, now)
+        return ip
 
     # ---- public API -------------------------------------------------------
 
@@ -168,13 +302,9 @@ class SourceVerifier:
 
     # ---- internals --------------------------------------------------------
 
-    def _redirect_handler(self) -> urllib.request.HTTPRedirectHandler:
-        if self.allow_private_networks:
-            return urllib.request.HTTPRedirectHandler()
-        return _PolicyRedirectHandler()
-
     def _request(self, req: urllib.request.Request, read_body: bool) -> tuple:
-        opener = _build_opener(req.full_url, self.proxy, self._redirect_handler())
+        opener = _build_opener(req.full_url, self.proxy,
+                               self._http_handler, self._https_handler)
         with opener.open(req, timeout=self.timeout) as resp:
             body = resp.read(self.max_bytes) if read_body else b""
             return resp.status, dict(resp.headers), body
@@ -188,17 +318,6 @@ class SourceVerifier:
         if not url.lower().startswith(("http://", "https://")):
             out["error"] = "unsupported-scheme"
             return out
-        if not self.allow_private_networks:
-            try:
-                policy_error = _address_policy_error(url)
-            except urllib.error.URLError as exc:
-                out["ok"] = None
-                out["error"] = f"network-unavailable: {getattr(exc, 'reason', exc)}"
-                return out
-            if policy_error:
-                out["ok"] = None
-                out["error"] = policy_error
-                return out
         head = urllib.request.Request(url, method="HEAD",
                                       headers={"User-Agent": USER_AGENT})
         try:
@@ -208,6 +327,12 @@ class SourceVerifier:
             if not out["ok"]:
                 out["error"] = f"http-{status}"
                 return out
+        except _PolicyBlocked as e:
+            # Definite failure: the name does not resolve to a connectable
+            # public address. This is a fact, not uncertainty — ok=False.
+            out["ok"] = False
+            out["error"] = str(e.reason)
+            return out
         except urllib.error.HTTPError as e:
             out["status_code"] = e.code
             if e.code in PROXY_ERROR_CODES:
@@ -224,8 +349,7 @@ class SourceVerifier:
         except urllib.error.URLError as e:
             # network failure ≠ dead source. Honest semantics: unknown.
             out["ok"] = None
-            reason = str(getattr(e, "reason", e))
-            out["error"] = reason if reason == "blocked-private-address" else f"network-unavailable: {reason}"
+            out["error"] = f"network-unavailable: {getattr(e, 'reason', e)}"
             return out
         except Exception as e:  # timeout, ssl, redirect loops …
             out["ok"] = None
@@ -240,16 +364,17 @@ class SourceVerifier:
             out["ok"] = status < 400
             out["bytes"] = len(body)
             out["sha256"] = hashlib.sha256(body).hexdigest()
-        except urllib.error.HTTPError as e:
-            out["status_code"] = e.code
-            if e.code in PROXY_ERROR_CODES:
-                out["ok"] = None
-            else:
-                out["ok"] = False
-            out["error"] = f"body-fetch-failed: HTTPError: {e}"
-        except Exception as e:
-            # HEAD alone proves existence, not that the source could be verified.
+        except _PolicyBlocked as e:
+            # redirect hop resolved to a non-public address: definite block
+            out["ok"] = False
+            out["error"] = str(e.reason)
+        except urllib.error.URLError as e:
+            # transport failed mid-fetch (e.g. refused at a redirect hop):
+            # that is uncertainty, not proof of death — honest ok=None
             out["ok"] = None
+            out["error"] = f"body-fetch-network-unavailable: {getattr(e, 'reason', e)}"
+        except Exception as e:
+            # HEAD said it exists but the body failed: exists, unverifiable content
             out["error"] = f"body-fetch-failed: {type(e).__name__}: {e}"
         return out
     def summary(self, results: List[dict]) -> dict:

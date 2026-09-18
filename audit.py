@@ -267,7 +267,7 @@ def collect_urls(report: dict) -> list:
 
 def verify_sources(report: dict, offline: bool = False,
                    cache_path: str | None = None,
-                   allow_private_networks: bool = True) -> tuple[dict, bool]:
+                   allow_private_networks: bool = False) -> tuple[dict, bool]:
     """Run the source verifier over claim URLs. Returns (integrity_blob, degraded)."""
     from verify import SourceVerifier
 

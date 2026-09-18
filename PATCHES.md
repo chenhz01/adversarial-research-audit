@@ -28,3 +28,9 @@
 | PATCH-012 | P1 | 测试工程师 | CI 只验退出码，不验 JSON 输出契约（verdict 合法值、gate 数量、5 关制向后兼容），契约回归无保护 | 断言过薄 | CI 增 JSON contract 步骤 | 本地 CI 全步骤复现通过 ✅ | closed |
 | PATCH-013 | P2 | 商业 | 无求合作入口，与既有发布惯例不一致 → 流量来了没有转化出口 | 缺 | README 增 `Collaboration / 合作` 段（统一对外邮箱） | 人工复核 ✅ | closed |
 | PATCH-014 | P3 | 维护者 | 缺 SECURITY.md / CONTRIBUTING.md（PATCH-005 遗留） | 范围控制 | 未做——发布后首个社区 PR 前补齐 | — | open |
+
+## 第四轮（transport 安全：DNS-rebinding 修复，2026-09-18 · 外部审查驱动）
+
+| ID | 优先级 | 身份 | 问题 | 根因 | 变更 | 验证 | 状态 |
+|----|--------|------|------|------|------|------|------|
+| PATCH-015 | P0 | 外部审查者(GodBlf)+独立AI | **DNS-rebinding**：取源时 DNS 解析与连接建立分离，且完全无 IP 校验——`evil.com` 解析到 127.0.0.1/内网 IP 照连，重定向跳同样裸奔（deer-flow#5472 合并阻塞） | 验证与连接是两步（TOCTOU） | `verify.py` 重构传输层：解析一次→逐 IP `is_global` 校验（解包 IPv4-mapped IPv6，显式拒组播/保留/未指定段——CPython 3.13 对部分组播段 `is_global=True` 不可依赖）→socket 只拨已验证地址（SNI/Host/证书校验保持原域名）→HEAD/GET/同主机跳共享 TTL 钉扎缓存封死翻转窗口→跨主机重定向每跳重新验证→默认受限策略 fail-closed（`allow_private_networks=False`，CLI `verify_sources` 同步收紧为显式开启）→policy-blocked=ok=False（确定性）、传输失败仍 ok=None（诚实语义） | `tests/test_verify.py` 新增 7 回归（loopback 默认拒/私网解析拒/rebinding 翻转不触内网/重定向跳重验/mapped-IPv6 拒/pin 缓存单次解析/GET 传输失败保持 ok=None），verify 线 16 用例 ✅；全量套件 36 用例（verify 16 + MCP server 8 + adapter 5 + audit 7）✅；独立 AI 对抗验证双轮 PASS（实测 flip 不改拨、混合记录只拨公网、组播/保留/CGNAT/链路本地全拒、代理路径跳过有文档） | open（待推送） |

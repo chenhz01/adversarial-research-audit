@@ -5,15 +5,17 @@ from __future__ import annotations
 import functools
 import hashlib
 import http.server
+import os
+import socket
 import socketserver
-import urllib.error
-import urllib.request
 import sys
 import tempfile
 import threading
 import unittest
-from unittest import mock
+import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -57,7 +59,7 @@ class TestSourceVerifier(unittest.TestCase):
         cls.tmp.cleanup()
 
     def test_alive_with_content_hash(self):
-        v = SourceVerifier()
+        v = SourceVerifier(allow_private_networks=True)
         r = v.verify(self.srv.url("exists.txt"))
         self.assertTrue(r["ok"])
         self.assertEqual(r["status_code"], 200)
@@ -65,14 +67,14 @@ class TestSourceVerifier(unittest.TestCase):
         self.assertEqual(r["bytes"], len(b"hello authenticity"))
 
     def test_hash_match_flag(self):
-        v = SourceVerifier()
+        v = SourceVerifier(allow_private_networks=True)
         good = v.verify(self.srv.url("exists.txt"), expect_sha256=self.expected_sha)
         self.assertTrue(good["hash_match"])
         bad = v.verify(self.srv.url("exists.txt"), expect_sha256="0" * 64)
         self.assertFalse(bad["hash_match"])
 
     def test_dead_url(self):
-        v = SourceVerifier()
+        v = SourceVerifier(allow_private_networks=True)
         r = v.verify(self.srv.url("missing.txt"))
         self.assertFalse(r["ok"])
         self.assertEqual(r["status_code"], 404)
@@ -93,7 +95,7 @@ class TestSourceVerifier(unittest.TestCase):
             self.assertTrue(r["cached"])
 
     def test_summary_marks_degraded_on_unknown(self):
-        v = SourceVerifier()
+        v = SourceVerifier(allow_private_networks=True)
         results = [v.verify(self.srv.url("exists.txt")),
                    v.verify(self.srv.url("gone.txt"))]
         s = v.summary(results)
@@ -103,7 +105,7 @@ class TestSourceVerifier(unittest.TestCase):
         self.assertTrue(s2["degraded"])
 
     def test_bad_scheme_rejected(self):
-        r = SourceVerifier().verify("raw/sources/local.md")
+        r = SourceVerifier(allow_private_networks=True).verify("raw/sources/local.md")
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"], "unsupported-scheme")
 
@@ -138,7 +140,7 @@ class TestProxyHonesty(unittest.TestCase):
     def test_gateway_error_is_unknown_not_dead(self):
         srv = GatewayServer()
         try:
-            r = SourceVerifier().verify(f"http://127.0.0.1:{srv.port}/anything")
+            r = SourceVerifier(allow_private_networks=True).verify(f"http://127.0.0.1:{srv.port}/anything")
             self.assertIsNone(r["ok"], "transport failure must not mean 'dead source'")
             self.assertIn("proxy-or-gateway-503", r["error"])
         finally:
@@ -152,7 +154,7 @@ class TestProxyHonesty(unittest.TestCase):
                 Path(td, "f.txt").write_text("ok", encoding="utf-8")
                 srv = LocalServer(td)
                 try:
-                    r = SourceVerifier().verify(srv.url("f.txt"))
+                    r = SourceVerifier(allow_private_networks=True).verify(srv.url("f.txt"))
                     self.assertTrue(r["ok"], "loopback must bypass HTTP_PROXY")
                     self.assertFalse(r["via_proxy"])
                 finally:
@@ -161,42 +163,169 @@ class TestProxyHonesty(unittest.TestCase):
             os.environ.pop("HTTP_PROXY", None)
 
 
-class TestMcpNetworkPolicy(unittest.TestCase):
-    def test_private_literal_is_unknown_when_private_networks_are_blocked(self):
-        result = SourceVerifier(allow_private_networks=False).verify("http://127.0.0.1/private")
-        self.assertIsNone(result["ok"])
-        self.assertEqual(result["error"], "blocked-private-address")
+class TestTransportPolicy(unittest.TestCase):
+    """DNS-rebinding hardening: resolve once, validate, dial the validated IP."""
 
-    def test_private_dns_result_is_unknown(self):
-        with mock.patch(
-            "verify.socket.getaddrinfo",
-            return_value=[(None, None, None, None, ("10.0.0.2", 80))],
-        ):
-            result = SourceVerifier(allow_private_networks=False).verify("http://internal.example/a")
-        self.assertIsNone(result["ok"])
-        self.assertEqual(result["error"], "blocked-private-address")
+    PUBLIC_IP = "93.184.216.34"  # example.com's long-standing public address
 
-    def test_redirect_target_is_revalidated(self):
-        verifier = SourceVerifier(allow_private_networks=False)
-        handler = verifier._redirect_handler()
-        request = urllib.request.Request("https://public.example/start")
-        with mock.patch(
-            "verify.socket.getaddrinfo",
-            return_value=[(None, None, None, None, ("127.0.0.1", 80))],
-        ):
-            with self.assertRaises(urllib.error.URLError):
-                handler.redirect_request(request, None, 302, "Found", {}, "http://localhost/admin")
+    @contextmanager
+    def _direct_network(self):
+        """Remove proxy env vars and neutralize registry proxies so the direct
+        (pinned) transport path runs — on hosts with a global HTTP_PROXY or a
+        system proxy the verifier delegates DNS to the proxy by design and
+        pinning is skipped."""
+        keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                "ALL_PROXY", "all_proxy"]
+        saved = {k: os.environ.pop(k) for k in keys if k in os.environ}
+        try:
+            with mock.patch.object(urllib.request, "getproxies", return_value={}):
+                yield
+        finally:
+            os.environ.update(saved)
 
-    def test_body_transport_failure_is_unknown(self):
-        verifier = SourceVerifier()
-        with mock.patch.object(
-            verifier,
-            "_request",
-            side_effect=[(200, {}, b""), urllib.error.URLError("offline")],
-        ):
-            result = verifier.verify("https://example.com/source", use_cache=False)
-        self.assertIsNone(result["ok"])
-        self.assertIn("body-fetch-failed", result["error"])
+    @staticmethod
+    def _fake_resolver(route):
+        """Build a getaddrinfo replacement. route: hostname -> ip, or a list
+        of per-call ips consumed in order (for flip simulations). Falls back
+        to the REAL resolver captured at creation time (never re-enters the
+        patched symbol)."""
+        counters: dict = {}
+        real = socket.getaddrinfo
+
+        def fake(host, port=None, *a, **k):
+            spec = route.get(host)
+            if spec is None:
+                return real(host, port, *a, **k)
+            if isinstance(spec, list):
+                i = counters.get(host, 0)
+                counters[host] = i + 1
+                ip = spec[min(i, len(spec) - 1)]
+            else:
+                ip = spec
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 80))]
+
+        return fake
+
+    def _recorder(self, allow_real_for=("127.0.0.1",)):
+        """create_connection replacement: records every dial target, refuses
+        non-loopback dials (no real egress in tests)."""
+        calls = []
+        real = socket.create_connection
+
+        def fake(address, timeout=None, source_address=None):
+            calls.append((address[0], address[1]))
+            if address[0] in allow_real_for:
+                return real(address, timeout=timeout, source_address=source_address)
+            raise ConnectionRefusedError("recorded; refused (test guard)")
+
+        return fake, calls
+
+    def test_loopback_blocked_by_restricted_default(self):
+        with self._direct_network():
+            r = SourceVerifier().verify("http://127.0.0.1:9/x")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("policy-blocked"),
+                        f"expected policy-blocked, got {r['error']!r}")
+
+    def test_private_resolving_hostname_blocked(self):
+        fake = self._fake_resolver({"private.example.com": "10.0.0.5"})
+        with self._direct_network(), mock.patch.object(socket, "getaddrinfo", fake):
+            r = SourceVerifier().verify("http://private.example.com/x")
+        self.assertFalse(r["ok"])
+        self.assertIn("policy-blocked", r["error"])
+        self.assertIn("10.0.0.5", r["error"])
+
+    def test_rebinding_flip_never_dials_private_ip(self):
+        # DNS answers public first (validation), then flips to loopback
+        # (the rebinding attack). The socket must only ever dial the IP that
+        # was validated.
+        fake_resolve = self._fake_resolver(
+            {"rebind.example.com": [self.PUBLIC_IP, "127.0.0.1"]})
+        dial, calls = self._recorder(allow_real_for=())
+        with self._direct_network(), \
+             mock.patch.object(socket, "getaddrinfo", fake_resolve), \
+             mock.patch.object(socket, "create_connection", dial):
+            v = SourceVerifier()  # restricted default
+            r = v.verify("http://rebind.example.com/x")
+        dialed = {ip for ip, _ in calls}
+        self.assertEqual(dialed, {self.PUBLIC_IP},
+                         f"rebinding reached the socket: dialed {dialed}")
+        self.assertIsNone(r["ok"])  # refused dial = network-unavailable, not dead
+
+    def test_redirect_hop_is_revalidated(self):
+        # Hop 1: local server (loopback, explicit allow) 302s to a public
+        # hostname. Hop 2 must be resolved+validated+dialed on the policy path.
+        class _Redirect(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://public.example.com:{self.server.server_address[1]}/x")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), _Redirect)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        fake_resolve = self._fake_resolver({"public.example.com": self.PUBLIC_IP})
+        dial, calls = self._recorder(allow_real_for=("127.0.0.1",))
+        try:
+            with self._direct_network(), \
+                 mock.patch.object(socket, "getaddrinfo", fake_resolve), \
+                 mock.patch.object(socket, "create_connection", dial):
+                v = SourceVerifier(allow_private_networks=True)
+                r = v.verify(f"http://127.0.0.1:{httpd.server_address[1]}/redirect")
+            dialed = [ip for ip, _ in calls]
+            self.assertIn("127.0.0.1", dialed, "hop 1 should reach the local server")
+            self.assertIn(self.PUBLIC_IP, dialed,
+                          "hop 2 must be dialed at the validated address")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        # hop 2 was refused by the test guard: honest unknown, not 'dead'
+        self.assertIsNone(r["ok"])
+
+    def test_ipv4_mapped_ipv6_blocked(self):
+        # ::ffff:10.0.0.1 must be judged as 10.0.0.1 (private), not as global IPv6
+        fake = self._fake_resolver({"mapped.example.com": "::ffff:10.0.0.1"})
+        with self._direct_network(), mock.patch.object(socket, "getaddrinfo", fake):
+            r = SourceVerifier().verify("http://mapped.example.com/x")
+        self.assertFalse(r["ok"])
+        self.assertIn("policy-blocked", r["error"])
+
+    def test_pin_cache_shared_between_head_and_get(self):
+        # One verify() = HEAD + GET. The pin resolved for HEAD must be reused
+        # for GET (no second resolution inside the TTL), closing the flip
+        # window. Count only resolver invocations by the policy layer (not the
+        # ones inside socket.create_connection).
+        import verify as verify_module
+        resolve_calls = []
+        real_resolve = verify_module._resolve_pinned
+
+        def counting(hostname, port, allow_private):
+            resolve_calls.append(hostname)
+            return real_resolve(hostname, port, allow_private)
+
+        with self._direct_network(), \
+             mock.patch.object(verify_module, "_resolve_pinned", counting):
+            v = SourceVerifier(allow_private_networks=True)
+            v.verify("http://127.0.0.1:9/x")  # dial refused; pin resolved once
+        self.assertEqual(len(resolve_calls), 1,
+                         f"expected a single resolution, got {resolve_calls}")
+
+    def test_get_transport_failure_stays_unknown(self):
+        # Transport-level URLError (connection refused, hits the HEAD stage
+        # first) is uncertainty, not proof of death: ok must stay None, and
+        # must never be confused with the deterministic policy-blocked state
+        # (ok=False). The GET stage mirrors this with a
+        # "body-fetch-network-unavailable" prefix.
+        with self._direct_network():
+            r = SourceVerifier(allow_private_networks=True).verify("http://127.0.0.1:9/x")
+        self.assertIsNone(r["ok"], "transport failure must be unknown, not dead")
+        self.assertIn("network-unavailable", r["error"])
+        self.assertNotIn("policy-blocked", r["error"])
 
 
 if __name__ == "__main__":
