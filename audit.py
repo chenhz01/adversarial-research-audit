@@ -122,10 +122,23 @@ def gate_integrity(report: dict) -> tuple[bool, str]:
     sv = integ.get("source_verification") or {}
     if sv.get("dead"):
         problems.append(f"{sv['dead']} cited URL(s) are dead/unreachable")
+    if sv.get("policy_blocked_failed"):
+        # Explicit opt-in only: a policy denial fails the audit when the caller
+        # asked for it (fail_on_policy_block), never as an emergent artefact of
+        # a policy block being modelled as "dead".
+        problems.append(
+            f"{sv.get('blocked', 0)} source(s) blocked by policy "
+            f"(fail_on_policy_block is set)")
     if sv.get("hash_drift"):
         problems.append(f"{sv['hash_drift']} source(s) failed content-hash check")
     uncited = integ.get("uncited_sources") or []
-    note = f" (note: {len(uncited)} source(s) never compiled)" if uncited else ""
+    notes = []
+    if uncited:
+        notes.append(f"{len(uncited)} source(s) never compiled")
+    if sv.get("blocked") and not sv.get("policy_blocked_failed"):
+        notes.append(f"{sv['blocked']} source(s) blocked by policy "
+                     f"(not counted as dead)")
+    note = f" (note: {'; '.join(notes)})" if notes else ""
     if problems:
         return False, "gate6 integrity: " + "; ".join(problems) + note
     return True, "gate6 integrity: citations, links and hashes verified" + note
@@ -144,7 +157,14 @@ GATES = [
 
 def judge_claims(report: dict) -> list[dict]:
     verdicts = []
-    for c in report.get("claims", []):
+    claims = report.get("claims", [])
+    if not isinstance(claims, list):
+        # audit() promises never to raise on malformed input: a non-list
+        # `claims` is degraded input, not a crash (red-team finding, PATCH-016 round)
+        return []
+    for c in claims:
+        if not isinstance(c, dict):
+            continue
         # dedupe sources: same URL or same name counts once — a mirror is not
         # an independent source (red-team finding PATCH-001)
         seen: set = set()
@@ -267,8 +287,15 @@ def collect_urls(report: dict) -> list:
 
 def verify_sources(report: dict, offline: bool = False,
                    cache_path: str | None = None,
-                   allow_private_networks: bool = False) -> tuple[dict, bool]:
-    """Run the source verifier over claim URLs. Returns (integrity_blob, degraded)."""
+                   allow_private_networks: bool = False,
+                   fail_on_policy_block: bool = False) -> tuple[dict, bool]:
+    """Run the source verifier over claim URLs. Returns (integrity_blob, degraded).
+
+    Each result carries a four-state outcome (alive | dead | unknown | blocked).
+    Policy-blocked sources are reported separately and never counted as dead: a
+    decision not to access a source says nothing about its liveness. Failing the
+    audit on a policy block is the explicit opt-in `fail_on_policy_block`.
+    """
     from verify import SourceVerifier
 
     urls = collect_urls(report)
@@ -278,19 +305,22 @@ def verify_sources(report: dict, offline: bool = False,
         cache_path=cache_path,
         offline=offline,
         allow_private_networks=allow_private_networks,
+        fail_on_policy_block=fail_on_policy_block,
     )
     results = v.verify_many(urls)
     s = v.summary(results)
-    dead = [r["url"] for r in results if r.get("ok") is False]
-    unknown = [r["url"] for r in results if r.get("ok") is None]
-    integ = {
-        "source_verification": {
-            "total": s["total"], "alive": s["alive"], "dead": s["dead"],
-            "unknown": s["unknown"], "hash_drift": s["hash_drift"],
-            "dead_urls": dead, "unknown_urls": unknown,
-        }
+    dead = [r["url"] for r in results if r.get("outcome") == "dead"]
+    unknown = [r["url"] for r in results if r.get("outcome") == "unknown"]
+    blocked = [r["url"] for r in results if r.get("outcome") == "blocked"]
+    blob = {
+        "total": s["total"], "alive": s["alive"], "dead": s["dead"],
+        "unknown": s["unknown"], "blocked": s["blocked"],
+        "hash_drift": s["hash_drift"],
+        "dead_urls": dead, "unknown_urls": unknown, "blocked_urls": blocked,
     }
-    return integ, s["degraded"]
+    if s.get("policy_failure"):
+        blob["policy_blocked_failed"] = True
+    return {"source_verification": blob}, s["degraded"]
 
 
 def main(argv: list[str]) -> int:
@@ -318,8 +348,9 @@ def main(argv: list[str]) -> int:
 
     degraded_verification = False
     if do_verify:
-        integ, degraded_verification = verify_sources(report, offline=offline,
-                                                     cache_path=cache_path)
+        integ, degraded_verification = verify_sources(
+            report, offline=offline, cache_path=cache_path,
+            fail_on_policy_block="--fail-on-policy-block" in argv)
         report.setdefault("integrity", {}).update(integ)
 
     envelope = audit(report)

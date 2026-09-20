@@ -24,14 +24,30 @@ Two additions turn this from a checklist into actual verification:
 **`verify.py` — source authenticity.** HTTP HEAD → content SHA-256, with on-disk caching, size caps, and honest failure semantics:
 
 ```
-[ALIVE] https://example.com/a   status=200 sha256=9f2c1ab3c4d5 …
-[DEAD ] https://example.com/b   status=404 http-404
-[UNKNWN] https://example.com/c  status=None proxy-or-gateway-503: transport failed
+[ALIVE  ] https://example.com/a  status=200 sha256=9f2c1ab3c4d5 …
+[DEAD   ] https://example.com/b  status=404 http-404
+[UNKNOWN] https://example.com/c  status=None proxy-or-gateway-503: transport failed
+[BLOCKED] http://127.0.0.1/x     status=None policy-blocked: resolves only to non-public address(es)
 ```
 
-Three honesty rules baked in:
-- **Transport failure ≠ dead source.** A proxy/gateway 502/503/504 or a missing network yields `ok=None` (unknown) and marks the audit `degraded` — never "the source is dead".
-- **Loopback bypasses egress proxies.** A sandbox/corporate `HTTP_PROXY` would otherwise turn every localhost check into a 502.
+Four outcomes, not two. Every result carries `outcome` ∈
+`alive | dead | unknown | blocked`, and `ok` is its liveness projection
+(`True` / `False` / `None`, where `None` covers both `unknown` and `blocked`):
+
+- **`alive`** — the URL resolved and its content was hashed.
+- **`dead`** — a definite answer that the source is not retrievable (e.g. 404).
+- **`unknown`** — the transport failed, timed out, or the configuration was
+  refused. Honest refusal to claim either way, never "the source is dead".
+- **`blocked`** — a policy decision not to access the source. This is definite,
+  but it establishes **nothing about liveness**, so it is reported separately
+  and never aggregated as `dead`. Failing a run on a policy block is the
+  explicit opt-in `fail_on_policy_block=True` (`--fail-on-policy-block`), never
+  an emergent artefact of the aggregation.
+
+Honesty rules baked in:
+- **Transport failure ≠ dead source.** A proxy/gateway 502/503/504 or a missing network yields `outcome=unknown` and marks the audit `degraded` — never "the source is dead".
+- **A body that never arrived is not a success.** If HEAD answers but the GET fails (timeout, TLS, redirect loop), the verification degrades to `unknown` instead of inheriting the HEAD stage's success.
+- **A proxy is rejected, not silently trusted.** A configured proxy (explicit or from the environment) performs the DNS lookup itself, so address validation and the DNS-rebinding pin cannot run. Under the restricted default the verifier refuses that configuration with `proxy-policy-unsupported` rather than falling back to an unpinned opener; `allow_private_networks=True` is the explicit opt-in that accepts the weaker guarantee. Loopback and `NO_PROXY`-matched URLs never traverse an egress proxy and keep the pinned path.
 - **Hash drift is reported, not ignored.** Pass a recorded hash to detect silent content changes.
 
 **`adapters/llm_wiki.py` — real adapter for [nashsu/llm_wiki](https://github.com/nashsu/llm_wiki) (18.9k★).** Grounded in that project's actual contract (`raw/sources/` → `wiki/{entities,concepts,sources,synthesis,comparisons}/`, YAML frontmatter with `sources[]`, `[[wikilink]]` cross-references), it verifies things arithmetic cannot:
@@ -105,11 +121,16 @@ execution failures.
 
 Set `verify_sources: true` in the tool arguments to fetch public HTTP(S) claim
 sources and arm gate 6. Transport failures remain `unknown` and set
-`degraded: true`; they are never counted as dead links. MCP source verification
-blocks loopback, private, link-local, reserved, and other non-public addresses,
-including redirect targets. Operators who intentionally audit trusted intranet
-URLs may set `ADVERSARIAL_RESEARCH_AUDIT_ALLOW_PRIVATE_NETWORKS=1` in the MCP
-server environment. This opt-in permits server-side requests to private
+`degraded: true`; they are never counted as dead links. Policy-blocked sources
+are reported separately as `blocked` in `integrity.source_verification`
+(`blocked` / `blocked_urls`) and are likewise never counted as dead — a policy
+decision not to access a source is not evidence that it is dead. MCP source
+verification blocks loopback, private, link-local, reserved, and other
+non-public addresses, including redirect targets, and refuses a proxy
+configuration under the restricted default (`proxy-policy-unsupported`) rather
+than running an unpinned transport. Operators who intentionally audit trusted
+intranet URLs may set `ADVERSARIAL_RESEARCH_AUDIT_ALLOW_PRIVATE_NETWORKS=1` in
+the MCP server environment. This opt-in permits server-side requests to private
 networks and should not be enabled for untrusted report inputs.
 
 The MCP input is capped at 1,000,000 JSON characters. `verify_sources` defaults
@@ -118,6 +139,41 @@ to `false`, so enabling the server alone performs no outbound requests.
 ### Pipeline integration
 
 Output uses a standard message envelope (`engine` / `version` / `inputs` / `outputs` / `confidence` / `degraded` / `trace_id`) — see `protocols/audit-protocol.md`. `degraded: true` means the audit itself was partial; downstream must not treat it as a clean verdict.
+
+### CLI adapter for shell / CI pipelines
+
+`cli_adapter.py` is the shell/CI counterpart of the MCP server: it emits the
+same unchanged JSON envelope on stdout (single line, machine-readable) while
+all diagnostics go to stderr, and it keeps an append-only JSONL audit log
+keyed by `trace_id` (`--audit-log PATH`). Exit codes follow a documented
+precedence table:
+
+| Exit | Meaning |
+|------|---------|
+| 0 | PASS or PASS-WITH-CAVEAT, `degraded: false` |
+| 1 | FAIL (regardless of `degraded` — the failure is a definite finding) |
+| 2 | input/usage error — no valid envelope was produced |
+| 3 | execution error (crash, or audit-log refusal) — never reported as `DEGRADED` |
+| 4 | PASS/PASS-WITH-CAVEAT but `degraded: true` — the verdict is unreliable. Also covers a degraded envelope with no verdict (input parsed as JSON but not an object) |
+
+If recording a verification opt-out fails, the adapter fails closed (exit 3,
+nothing audited) rather than producing an envelope that cannot be traced.
+The adapter introduces no envelope semantics: `coverage` data is forwarded to
+the engine untouched, and an unknown candidate total is never replaced by the
+observed set size (see the core-contract discussion in issue #2). Source
+verification uses the same restricted public-network policy as the MCP server
+(`ADVERSARIAL_RESEARCH_AUDIT_ALLOW_PRIVATE_NETWORKS=1` to opt in explicitly).
+
+```bash
+python cli_adapter.py report.json --verify-sources --audit-log audit.jsonl
+cat report.json | python cli_adapter.py - --quiet   # CI: no stdout, exit code only
+```
+
+Argument parsing is strict: an unknown option, or a valued flag missing its
+value (e.g. `--audit-log` with no path), is a usage error (exit 2) — never a
+silent fallback, because a silently dropped `--audit-log` or `--offline`
+would defeat the audit trail or trigger unexpected online verification.
+
 
 ## Why "regenerate", not "annotate"
 

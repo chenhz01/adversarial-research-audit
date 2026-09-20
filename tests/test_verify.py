@@ -223,7 +223,10 @@ class TestTransportPolicy(unittest.TestCase):
     def test_loopback_blocked_by_restricted_default(self):
         with self._direct_network():
             r = SourceVerifier().verify("http://127.0.0.1:9/x")
-        self.assertFalse(r["ok"])
+        # A policy denial is definite, but it establishes nothing about
+        # liveness: blocked is its own outcome, never "dead".
+        self.assertIsNone(r["ok"])
+        self.assertEqual(r["outcome"], "blocked")
         self.assertTrue(r["error"].startswith("policy-blocked"),
                         f"expected policy-blocked, got {r['error']!r}")
 
@@ -231,7 +234,8 @@ class TestTransportPolicy(unittest.TestCase):
         fake = self._fake_resolver({"private.example.com": "10.0.0.5"})
         with self._direct_network(), mock.patch.object(socket, "getaddrinfo", fake):
             r = SourceVerifier().verify("http://private.example.com/x")
-        self.assertFalse(r["ok"])
+        self.assertIsNone(r["ok"])
+        self.assertEqual(r["outcome"], "blocked")
         self.assertIn("policy-blocked", r["error"])
         self.assertIn("10.0.0.5", r["error"])
 
@@ -292,7 +296,8 @@ class TestTransportPolicy(unittest.TestCase):
         fake = self._fake_resolver({"mapped.example.com": "::ffff:10.0.0.1"})
         with self._direct_network(), mock.patch.object(socket, "getaddrinfo", fake):
             r = SourceVerifier().verify("http://mapped.example.com/x")
-        self.assertFalse(r["ok"])
+        self.assertIsNone(r["ok"])
+        self.assertEqual(r["outcome"], "blocked")
         self.assertIn("policy-blocked", r["error"])
 
     def test_pin_cache_shared_between_head_and_get(self):
@@ -319,13 +324,206 @@ class TestTransportPolicy(unittest.TestCase):
         # Transport-level URLError (connection refused, hits the HEAD stage
         # first) is uncertainty, not proof of death: ok must stay None, and
         # must never be confused with the deterministic policy-blocked state
-        # (ok=False). The GET stage mirrors this with a
+        # (ok=None + outcome="blocked"). The GET stage mirrors this with a
         # "body-fetch-network-unavailable" prefix.
         with self._direct_network():
             r = SourceVerifier(allow_private_networks=True).verify("http://127.0.0.1:9/x")
         self.assertIsNone(r["ok"], "transport failure must be unknown, not dead")
         self.assertIn("network-unavailable", r["error"])
         self.assertNotIn("policy-blocked", r["error"])
+
+    # ---- external-review findings (GodBlf, 2026-09-20) --------------------
+
+    def test_head_ok_then_get_success_shares_one_pin(self):
+        # Evidence gap: the pin-sharing test above stops at a refused HEAD, so
+        # HEAD→GET on a *successful* path was never exercised. Here HEAD 200 is
+        # followed by a real GET 200; both must reuse one resolution.
+        import verify as verify_module
+        resolve_calls = []
+        real_resolve = verify_module._resolve_pinned
+
+        def counting(hostname, port, allow_private):
+            resolve_calls.append(hostname)
+            return real_resolve(hostname, port, allow_private)
+
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "doc.txt").write_text("pin me", encoding="utf-8")
+            expected = hashlib.sha256(b"pin me").hexdigest()
+            srv = LocalServer(td)
+            try:
+                with self._direct_network(), \
+                     mock.patch.object(verify_module, "_resolve_pinned", counting):
+                    r = SourceVerifier(allow_private_networks=True).verify(srv.url("doc.txt"))
+            finally:
+                srv.close()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["outcome"], "alive")
+        self.assertEqual(r["sha256"], expected)
+        self.assertEqual(len(resolve_calls), 1,
+                         f"HEAD and GET must share one resolution, got {resolve_calls}")
+
+    def test_head_ok_then_get_timeout_is_unknown_not_success(self):
+        # Finding 2: HEAD mocked 200 then GET raises TimeoutError. The generic
+        # GET handler used to leave ok=True from the HEAD stage, so the summary
+        # reported alive=1 / degraded=False for a run that never verified the
+        # body. It must degrade to unknown.
+        import verify as verify_module
+
+        def fake_request(self, req, read_body):
+            if not read_body:
+                return 200, {}, b""
+            raise TimeoutError("read timed out")
+
+        with mock.patch.object(verify_module.SourceVerifier, "_request", fake_request):
+            v = SourceVerifier(allow_private_networks=True)
+            r = v.verify("http://public.example.com/x")
+            s = v.summary([r])
+        self.assertIsNone(r["ok"], "unverifiable content must not be a success")
+        self.assertEqual(r["outcome"], "unknown")
+        self.assertIn("body-fetch-failed", r["error"])
+        self.assertNotEqual(s["alive"], 1)
+        self.assertEqual((s["alive"], s["dead"], s["unknown"]), (0, 0, 1))
+        self.assertTrue(s["degraded"], "an unverified body must degrade the run")
+
+    def test_policy_blocked_is_not_counted_as_dead(self):
+        # Finding 3: a policy decision not to access a source must not be
+        # aggregated as a dead source.
+        with self._direct_network():
+            v = SourceVerifier()
+            r = v.verify("http://127.0.0.1:9/x")
+            s = v.summary([r])
+        self.assertEqual(r["outcome"], "blocked")
+        self.assertEqual(s["dead"], 0, "a policy block is not evidence of death")
+        self.assertEqual(s["blocked"], 1)
+        self.assertTrue(s["degraded"])
+        self.assertNotIn("policy_failure", s)
+
+    def test_fail_on_policy_block_is_explicit_opt_in(self):
+        # Failing a run on a policy block is a configured choice, never an
+        # emergent artefact of the aggregation.
+        with self._direct_network():
+            v = SourceVerifier(fail_on_policy_block=True)
+            r = v.verify("http://127.0.0.1:9/x")
+            s = v.summary([r])
+        self.assertEqual(s["blocked"], 1)
+        self.assertTrue(s.get("policy_failure"),
+                        "fail_on_policy_block must surface a policy failure")
+
+    def test_restricted_mode_redirect_to_private_target_is_blocked(self):
+        # Evidence gap: the existing redirect test enables private networks.
+        # Here hop 1 resolves public (rewired onto the local server) and the
+        # redirect points at a private target, which restricted mode must
+        # refuse — as "blocked", never as "dead".
+        class _Redirect(http.server.BaseHTTPRequestHandler):
+            def _redirect(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://private.example.com:{self.server.server_address[1]}/x")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_HEAD = _redirect
+            do_GET = _redirect
+
+            def log_message(self, *a):
+                pass
+
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), _Redirect)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        fake_resolve = self._fake_resolver({"public.example.com": self.PUBLIC_IP,
+                                            "private.example.com": "10.0.0.5"})
+        real_create = socket.create_connection
+
+        def rewire(address, timeout=None, source_address=None):
+            host, prt = address
+            if host == self.PUBLIC_IP:      # land hop 1 on the local server
+                return real_create(("127.0.0.1", prt), timeout=timeout,
+                                   source_address=source_address)
+            raise AssertionError(f"unexpected dial to {address}")
+
+        try:
+            with self._direct_network(), \
+                 mock.patch.object(socket, "getaddrinfo", fake_resolve), \
+                 mock.patch.object(socket, "create_connection", rewire):
+                r = SourceVerifier().verify(f"http://public.example.com:{port}/x")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(r.get("outcome"), "blocked", r)
+        self.assertIsNone(r["ok"])
+        self.assertTrue(r["error"].startswith("policy-blocked"), r["error"])
+
+
+class TestProxyPolicyFailClosed(unittest.TestCase):
+    """Finding 1: a configured proxy takes DNS away from the verifier, so
+    restricted mode must reject the configuration instead of silently running
+    an unpinned opener."""
+
+    PUBLIC_URL = "http://public.example.com/x"
+
+    @contextmanager
+    def _clean_proxy_env(self):
+        keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]
+        saved = {k: os.environ.pop(k) for k in keys if k in os.environ}
+        try:
+            yield
+        finally:
+            os.environ.update(saved)
+
+    def test_restricted_mode_rejects_explicit_proxy(self):
+        with self._clean_proxy_env():
+            r = SourceVerifier(proxy="http://127.0.0.1:9").verify(self.PUBLIC_URL)
+        self.assertIsNone(r["ok"], "a rejected config is not a liveness claim")
+        self.assertEqual(r["outcome"], "unknown")
+        self.assertTrue(r["error"].startswith("proxy-policy-unsupported"),
+                        r["error"])
+
+    def test_restricted_mode_rejects_environment_proxy(self):
+        with self._clean_proxy_env(), \
+             mock.patch.object(urllib.request, "getproxies",
+                               return_value={"http": "http://127.0.0.1:9"}):
+            r = SourceVerifier().verify(self.PUBLIC_URL)
+        self.assertIsNone(r["ok"])
+        self.assertEqual(r["outcome"], "unknown")
+        self.assertTrue(r["error"].startswith("proxy-policy-unsupported"),
+                        r["error"])
+
+    def test_env_proxy_does_not_bypass_validation_when_proxied_url_is_plain(self):
+        # Regression on the old fallback: with an env proxy configured, the
+        # restricted path must never hand the request to a bare (unpinned)
+        # opener. Both stages must refuse, not fall back.
+        import verify as verify_module
+        with self._clean_proxy_env(), \
+             mock.patch.object(urllib.request, "getproxies",
+                               return_value={"https": "http://127.0.0.1:9"}):
+            with self.assertRaises(verify_module._ProxyPolicyUnsupported):
+                verify_module._build_opener(self.PUBLIC_URL, None, None, None)
+
+    def test_no_proxy_matched_url_keeps_the_pinned_path(self):
+        # NO_PROXY-matched URLs never traverse the egress proxy, so they must
+        # keep the pinned handlers rather than being rejected.
+        import verify as verify_module
+        v = SourceVerifier(allow_private_networks=True)
+        with self._clean_proxy_env(), \
+             mock.patch.dict(os.environ, {"NO_PROXY": "example.com"}), \
+             mock.patch.object(urllib.request, "getproxies",
+                               return_value={"http": "http://127.0.0.1:9"}):
+            opener = verify_module._build_opener(
+                self.PUBLIC_URL, None, v._http_handler, v._https_handler)
+        self.assertIsNotNone(opener)
+
+    def test_explicit_proxy_allowed_when_opted_in(self):
+        # allow_private_networks=True is the documented escape hatch: it says
+        # "I accept that through a proxy, DNS pinning does not run". The fetch
+        # then fails on the dead proxy (unknown), not on the policy.
+        with self._clean_proxy_env():
+            r = SourceVerifier(proxy="http://127.0.0.1:9",
+                               allow_private_networks=True).verify(self.PUBLIC_URL)
+        self.assertNotIn("proxy-policy-unsupported", r["error"])
+        self.assertIsNone(r["ok"])
 
 
 if __name__ == "__main__":

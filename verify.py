@@ -22,6 +22,23 @@ legitimately need loopback/private targets must pass
 `allow_private_networks=True` explicitly — the restricted default never
 inherits silently.
 
+Proxy policy (restricted mode fails closed): a configured proxy — an explicit
+`proxy=` argument or any environment proxy that applies to the URL — takes DNS
+away from this module, because the proxy performs the lookup. Address
+validation and pinning therefore cannot run, so restricted mode **rejects**
+that configuration with `proxy-policy-unsupported` instead of silently falling
+back to an unpinned opener. Callers that accept the weaker guarantee through a
+proxy must opt in with `allow_private_networks=True`. Loopback and
+NO_PROXY-matched URLs never traverse an egress proxy and keep the pinned path.
+
+Four outcomes, not two: every result carries `outcome` ∈
+`alive | dead | unknown | blocked`. `alive`/`dead` are liveness claims;
+`unknown` (transport failure, timeout, proxy rejection) is the honest refusal
+to claim either; `blocked` is a policy decision not to access the source,
+which establishes nothing about liveness. Only `dead` is counted as dead, and
+failing a run on a policy block is an explicit opt-in
+(`fail_on_policy_block=True`), never an emergent artefact.
+
 Zero dependencies (stdlib urllib). Usable as a library or as a CLI:
 
     python verify.py https://example.com/a https://example.com/b
@@ -68,10 +85,22 @@ class TransportPolicy:
 
     allow_private_networks: bool = False
     pin_ttl: float = 30.0  # seconds a validated (host, port) -> IP pin stays fresh
+    fail_on_policy_block: bool = False  # explicit opt-in: a policy denial fails the run
 
 
 class _PolicyBlocked(urllib.error.URLError):
-    """Raised when DNS records fail the transport policy (definite, not unknown)."""
+    """Raised when DNS records fail the transport policy (definite policy fact,
+    but NOT evidence about liveness — see `outcome == "blocked"`)."""
+
+
+class _ProxyPolicyUnsupported(urllib.error.URLError):
+    """Raised in restricted mode when a proxy is configured.
+
+    Through a proxy we do not perform the DNS lookup, so address validation and
+    pinning cannot run; restricted mode refuses that configuration rather than
+    silently degrading the boundary. Not a liveness signal (`outcome` stays
+    `unknown`).
+    """
 
 
 def _addr_allowed(ip: ipaddress.IPAddress, allow_private_networks: bool) -> bool:
@@ -188,31 +217,79 @@ def _is_loopback(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".localhost")
 
 
+def _no_proxy_match(url: str) -> bool:
+    """True when NO_PROXY/no_proxy names a host that appears in the URL.
+
+    Such URLs never traverse an egress proxy, so they keep the pinned path.
+    """
+    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
+    return bool(no_proxy) and any(
+        h.strip() and h.strip() in url for h in no_proxy.split(","))
+
+
 def _build_opener(url: str, proxy: str | None,
-                  http_handler, https_handler) -> urllib.request.OpenerDirector:
+                  http_handler, https_handler,
+                  allow_private_networks: bool = False
+                  ) -> urllib.request.OpenerDirector:
     """Build the opener for one request.
 
     Direct (proxy-free) connections go through the pinned handlers: DNS is
     resolved+validated once, and the socket dials the validated address only.
-    When an explicit proxy is configured, or environment proxies apply to the
-    URL, DNS belongs to the proxy — pinning is skipped there by design.
-    Loopback and NO_PROXY-matched URLs never traverse an egress proxy (see
-    the loopback rule below).
+
+    Loopback and NO_PROXY-matched URLs never traverse an egress proxy, so they
+    keep the pinned handlers unconditionally.
+
+    A configured proxy (explicit `proxy`, or any environment proxy that applies
+    to the URL) performs the DNS lookup itself, so validation and pinning cannot
+    run. Restricted mode must not silently drop that boundary: it rejects the
+    configuration with `_ProxyPolicyUnsupported` (fail closed). Callers that
+    accept the weaker guarantee through a proxy must opt in explicitly with
+    `allow_private_networks=True`.
     """
-    if proxy:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    if _is_loopback(url):
+    if _is_loopback(url) or _no_proxy_match(url):
         return urllib.request.build_opener(
             urllib.request.ProxyHandler({}), http_handler, https_handler)
-    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
-    if no_proxy and any(h.strip() and h.strip() in url for h in no_proxy.split(",")):
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), http_handler, https_handler)
-    if urllib.request.getproxies():
+    env_proxies = urllib.request.getproxies()
+    if proxy or env_proxies:
+        if not allow_private_networks:
+            raise _ProxyPolicyUnsupported(
+                "proxy-policy-unsupported: a proxy is configured (explicit=%r, "
+                "environment=%r), so DNS resolves at the proxy and address "
+                "validation/pinning cannot run; restricted mode refuses rather "
+                "than silently degrading the boundary. Clear the proxy, or opt "
+                "in explicitly with allow_private_networks=True."
+                % (proxy, sorted(env_proxies) if not proxy else []))
+        if proxy:
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         return urllib.request.build_opener()
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}), http_handler, https_handler)
+
+
+def _proxy_rejection_text(exc: BaseException) -> str:
+    """Normalise a proxy-policy rejection into a stable, greppable error text."""
+    text = str(getattr(exc, "reason", exc)) or exc.__class__.__name__
+    if not text.startswith("proxy-policy-unsupported"):
+        text = f"proxy-policy-unsupported: {text}"
+    return text
+
+
+def _outcome_of(res: dict) -> str:
+    """Project a result onto the four-state outcome (alive|dead|unknown|blocked).
+
+    `outcome` is authoritative when a fetch set it; otherwise it is derived
+    from the liveness projection `ok`, so cache entries written by an older
+    version stay readable.
+    """
+    outcome = res.get("outcome")
+    if outcome in ("alive", "dead", "unknown", "blocked"):
+        return outcome
+    if res.get("ok") is True:
+        return "alive"
+    if res.get("ok") is False:
+        return "dead"
+    return "unknown"
 
 
 class SourceVerifier:
@@ -225,13 +302,15 @@ class SourceVerifier:
                  offline: bool = False,
                  proxy: Optional[str] = None,
                  allow_private_networks: bool = False,
-                 pin_ttl: float = 30.0):
+                 pin_ttl: float = 30.0,
+                 fail_on_policy_block: bool = False):
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.offline = offline
         self.proxy = proxy
         self.policy = TransportPolicy(allow_private_networks=allow_private_networks,
-                                      pin_ttl=pin_ttl)
+                                      pin_ttl=pin_ttl,
+                                      fail_on_policy_block=fail_on_policy_block)
         # Validated-address pins: (scheme, host, port) -> (ip, monotonic ts).
         # Shared by HEAD and GET (and same-host redirect hops) so a DNS flip
         # between requests cannot re-point the socket inside one verify() call.
@@ -273,19 +352,27 @@ class SourceVerifier:
 
     def verify(self, url: str, expect_sha256: Optional[str] = None,
                use_cache: bool = True) -> dict:
-        """Return {url, ok, status_code, sha256, bytes, error, cached}."""
+        """Return {url, ok, outcome, status_code, sha256, bytes, error, cached}.
+
+        `outcome` is the authoritative four-state field (alive | dead | unknown
+        | blocked); `ok` is its liveness projection (True / False / None, where
+        None covers both unknown and blocked).
+        """
         if use_cache and url in self.cache:
             res = dict(self.cache[url])
+            res["outcome"] = _outcome_of(res)
             res["cached"] = True
             if expect_sha256:
                 res["hash_match"] = (res.get("sha256") == expect_sha256)
             return res
 
         if self.offline:
-            return {"url": url, "ok": None, "status_code": None, "sha256": None,
+            return {"url": url, "ok": None, "outcome": "unknown",
+                    "status_code": None, "sha256": None,
                     "bytes": None, "error": "offline-mode", "cached": False}
 
         res = self._fetch(url)
+        res["outcome"] = _outcome_of(res)
         if expect_sha256:
             res["hash_match"] = (res.get("sha256") == expect_sha256)
         if self.cache_path:
@@ -304,18 +391,23 @@ class SourceVerifier:
 
     def _request(self, req: urllib.request.Request, read_body: bool) -> tuple:
         opener = _build_opener(req.full_url, self.proxy,
-                               self._http_handler, self._https_handler)
+                               self._http_handler, self._https_handler,
+                               allow_private_networks=(
+                                   self.policy.allow_private_networks))
         with opener.open(req, timeout=self.timeout) as resp:
             body = resp.read(self.max_bytes) if read_body else b""
             return resp.status, dict(resp.headers), body
 
     def _fetch(self, url: str) -> dict:
-        out = {"url": url, "ok": False, "status_code": None, "sha256": None,
-               "bytes": None, "error": "", "cached": False,
+        out = {"url": url, "ok": False, "outcome": "dead", "status_code": None,
+               "sha256": None, "bytes": None, "error": "", "cached": False,
                "via_proxy": bool(self.proxy) or (not _is_loopback(url)
                                                  and url.startswith(("http://", "https://"))
                                                  and urllib.request.getproxies())}
         if not url.lower().startswith(("http://", "https://")):
+            # Not a source-liveness question at all: the input is not a URL we
+            # can verify. Kept as a definite rejection (dead), never counted as
+            # a network unknown.
             out["error"] = "unsupported-scheme"
             return out
         head = urllib.request.Request(url, method="HEAD",
@@ -324,13 +416,22 @@ class SourceVerifier:
             status, headers, _ = self._request(head, read_body=False)
             out["status_code"] = status
             out["ok"] = status < 400
+            out["outcome"] = "alive" if out["ok"] else "dead"
             if not out["ok"]:
                 out["error"] = f"http-{status}"
                 return out
+        except _ProxyPolicyUnsupported as e:
+            # Restricted mode refuses a proxy configuration rather than
+            # skipping address validation. No liveness claim: unknown.
+            out["ok"] = None
+            out["outcome"] = "unknown"
+            out["error"] = _proxy_rejection_text(e)
+            return out
         except _PolicyBlocked as e:
-            # Definite failure: the name does not resolve to a connectable
-            # public address. This is a fact, not uncertainty — ok=False.
-            out["ok"] = False
+            # A policy decision NOT to access the source. This is definite, but
+            # it establishes nothing about liveness — never counted as dead.
+            out["ok"] = None
+            out["outcome"] = "blocked"
             out["error"] = str(e.reason)
             return out
         except urllib.error.HTTPError as e:
@@ -338,6 +439,7 @@ class SourceVerifier:
             if e.code in PROXY_ERROR_CODES:
                 # transport-layer failure, not proof of death
                 out["ok"] = None
+                out["outcome"] = "unknown"
                 out["error"] = (f"proxy-or-gateway-{e.code}: transport failed, "
                                 f"cannot conclude the source is dead")
                 return out
@@ -349,10 +451,12 @@ class SourceVerifier:
         except urllib.error.URLError as e:
             # network failure ≠ dead source. Honest semantics: unknown.
             out["ok"] = None
+            out["outcome"] = "unknown"
             out["error"] = f"network-unavailable: {getattr(e, 'reason', e)}"
             return out
         except Exception as e:  # timeout, ssl, redirect loops …
             out["ok"] = None
+            out["outcome"] = "unknown"
             out["error"] = f"unknown: {type(e).__name__}: {e}"
             return out
 
@@ -362,30 +466,59 @@ class SourceVerifier:
             status, headers, body = self._request(get, read_body=True)
             out["status_code"] = status
             out["ok"] = status < 400
+            out["outcome"] = "alive" if out["ok"] else "dead"
             out["bytes"] = len(body)
             out["sha256"] = hashlib.sha256(body).hexdigest()
+        except _ProxyPolicyUnsupported as e:
+            out["ok"] = None
+            out["outcome"] = "unknown"
+            out["error"] = _proxy_rejection_text(e)
         except _PolicyBlocked as e:
-            # redirect hop resolved to a non-public address: definite block
-            out["ok"] = False
+            # redirect hop resolved to a non-public address: a policy decision,
+            # not evidence that the source is dead
+            out["ok"] = None
+            out["outcome"] = "blocked"
             out["error"] = str(e.reason)
         except urllib.error.URLError as e:
             # transport failed mid-fetch (e.g. refused at a redirect hop):
             # that is uncertainty, not proof of death — honest ok=None
             out["ok"] = None
+            out["outcome"] = "unknown"
             out["error"] = f"body-fetch-network-unavailable: {getattr(e, 'reason', e)}"
         except Exception as e:
-            # HEAD said it exists but the body failed: exists, unverifiable content
+            # HEAD said it exists but the body failed (TimeoutError, SSL, …):
+            # the content is unverifiable, so this is NOT a successful
+            # verification — degrade to unknown instead of inheriting the
+            # HEAD stage's ok=True.
+            out["ok"] = None
+            out["outcome"] = "unknown"
             out["error"] = f"body-fetch-failed: {type(e).__name__}: {e}"
         return out
+
     def summary(self, results: List[dict]) -> dict:
+        """Aggregate results.
+
+        `dead` counts only definite death (`outcome == "dead"`); policy-blocked
+        sources are reported separately and never inflate `dead`, because a
+        decision not to access a source says nothing about its liveness. Any
+        unknown or blocked result makes the run `degraded` (the verification is
+        partial). Failing the run on a policy block is the explicit opt-in
+        `fail_on_policy_block`, surfaced as `policy_failure`.
+        """
         total = len(results)
-        alive = sum(1 for r in results if r.get("ok") is True)
-        dead = sum(1 for r in results if r.get("ok") is False)
-        unknown = total - alive - dead
+        outcomes = [_outcome_of(r) for r in results]
+        alive = outcomes.count("alive")
+        dead = outcomes.count("dead")
+        blocked = outcomes.count("blocked")
+        unknown = total - alive - dead - blocked
         drifted = sum(1 for r in results if r.get("hash_match") is False)
-        return {"total": total, "alive": alive, "dead": dead,
-                "unknown": unknown, "hash_drift": drifted,
-                "degraded": unknown > 0}
+        summary = {"total": total, "alive": alive, "dead": dead,
+                   "unknown": unknown, "blocked": blocked,
+                   "hash_drift": drifted,
+                   "degraded": unknown > 0 or blocked > 0}
+        if self.policy.fail_on_policy_block and blocked:
+            summary["policy_failure"] = True
+        return summary
 
 
 def main(argv: List[str]) -> int:
@@ -398,16 +531,20 @@ def main(argv: List[str]) -> int:
         i = argv.index("--cache")
         cache = argv[i + 1] if i + 1 < len(argv) else None
     offline = "--offline" in argv
-    v = SourceVerifier(cache_path=cache, offline=offline)
+    v = SourceVerifier(cache_path=cache, offline=offline,
+                       fail_on_policy_block="--fail-on-policy-block" in argv)
     results = v.verify_many(urls)
+    marks = {"alive": "ALIVE", "dead": "DEAD",
+             "unknown": "UNKNOWN", "blocked": "BLOCKED"}
     for r in results:
-        mark = "ALIVE" if r["ok"] else ("UNKNOWN" if r["ok"] is None else "DEAD")
-        print(f"[{mark}] {r['url']}  status={r['status_code']} "
+        print(f"[{marks[_outcome_of(r)]}] {r['url']}  status={r['status_code']} "
               f"sha256={(r['sha256'] or '-')[:12]} {r['error']}")
     s = v.summary(results)
     print(f"summary: {s['alive']}/{s['total']} alive, {s['dead']} dead, "
-          f"{s['unknown']} unknown, hash_drift={s['hash_drift']}")
-    return 0 if s["dead"] == 0 and not s["degraded"] else 1
+          f"{s['blocked']} policy-blocked, {s['unknown']} unknown, "
+          f"hash_drift={s['hash_drift']}")
+    failed = s["dead"] > 0 or s["degraded"] or s.get("policy_failure", False)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
