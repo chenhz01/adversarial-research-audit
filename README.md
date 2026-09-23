@@ -1,5 +1,26 @@
 # adversarial-research-audit
 
+> **Catch AI research reports that lie without lying — mechanical gates, zero dependencies**
+
+机械闸门抓『没撒谎但撒谎』的研究报告：覆盖率算术/簇求和/过滤溯源/引用完整性（吸收 resilient-agent-toolkit 1&2 / trending-scout）
+
+## Install (one line)
+```bash
+pip install adversarial-research-audit
+```
+
+## Why not X?
+| | ARA | 人工审阅 |
+|---|---|---|
+| 速度 | 机械闸门秒级 | 小时级 |
+| 稳定 | 规则可复现 | 因人而异 |
+
+Topics: `ai-audit` · `research-integrity` · `agent` · `cli` · `zero-dependency`
+
+---
+
+# adversarial-research-audit
+
 **Audit layer for agentic research tools: catch coverage fraud and evidence hygiene failures before they reach your knowledge base.**
 
 The agentic-research ecosystem is booming: agents crawl, synthesize, and deposit "knowledge" into wikis and reports. What none of them do is *adversarially check their own output*. The result is knowledge bases that look trustworthy and are unauditable.
