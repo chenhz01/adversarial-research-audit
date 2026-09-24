@@ -5,8 +5,7 @@
 > **Target**: https://github.com/obra/superpowers/issues/2332
 > **Related**: #2342 (executing-plans misreads last log line as test result — same root cause)
 > **Auditor**: @chenhz01 (independent, no maintainer role in obra/superpowers)
-> **Status**: PRE-AUDIT (framework + evidence collection plan; execution run requires local
-> superpowers environment, scheduled next session)
+> **Status**: EXECUTED 2026-09-24 — see [superpowers-2332-audit-report.md](superpowers-2332-audit-report.md)
 
 ## 1. Scope
 
