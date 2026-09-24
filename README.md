@@ -166,19 +166,30 @@ Output uses a standard message envelope (`engine` / `version` / `inputs` / `outp
 `cli_adapter.py` is the shell/CI counterpart of the MCP server: it emits the
 same unchanged JSON envelope on stdout (single line, machine-readable) while
 all diagnostics go to stderr, and it keeps an append-only JSONL audit log
-keyed by `trace_id` (`--audit-log PATH`). Exit codes follow a documented
-precedence table:
+keyed by `trace_id` (`--audit-log PATH`). Exit codes follow the protocol's
+two-axis table — **execution status** (how the run ended) is separate from
+`outputs.verdict` / `degraded` (what the audit found):
 
-| Exit | Meaning |
-|------|---------|
-| 0 | PASS or PASS-WITH-CAVEAT, `degraded: false` |
-| 1 | FAIL (regardless of `degraded` — the failure is a definite finding) |
-| 2 | input/usage error — no valid envelope was produced |
-| 3 | execution error (crash, or audit-log refusal) — never reported as `DEGRADED` |
-| 4 | PASS/PASS-WITH-CAVEAT but `degraded: true` — the verdict is unreliable. Also covers a degraded envelope with no verdict (input parsed as JSON but not an object) |
+| Exit | Execution status | Envelope | verdict | degraded | Reading |
+|------|------------------|----------|---------|----------|---------|
+| 0  | SUCCESS | present | PASS | false | clean pass |
+| 10 | SUCCESS | present | PASS | true | pass, sources unverified |
+| 11 | SUCCESS | present | PASS-WITH-CAVEAT | any | pass with named caveats |
+| 12 | SUCCESS | present | FAIL | false | business FAIL, artifact present |
+| 13 | SUCCESS | present | FAIL | true | business FAIL + unverified sources |
+| 2  | EXPLICIT_FAILURE | present | — | — | named failure, reason carried (reserved; no current path) |
+| 3  | SILENT_TIMEOUT | absent | — | — | no artifact: crash or failed start — never `DEGRADED` |
+| 4  | USAGE_ERROR | absent | — | — | malformed input, or an envelope carrying no verdict |
+| 5  | POLICY_DENIED | absent | — | — | a refusal we could not record; fail closed |
 
-If recording a verification opt-out fails, the adapter fails closed (exit 3,
-nothing audited) rather than producing an envelope that cannot be traced.
+The normative table lives in `protocols/audit-protocol.md` § "Execution status
+and exit codes". `degraded` never upgrades or downgrades a `FAIL`: 12 and 13
+differ only in whether the sources behind that failure were verifiable.
+
+If recording a verification opt-out fails, the adapter fails closed (exit 5,
+nothing audited) rather than producing an envelope that cannot be traced. That
+is a *policy* refusal, not a crash — the exit code is different because "we
+refused to proceed without a trail" and "the engine broke" are different facts.
 The adapter introduces no envelope semantics: `coverage` data is forwarded to
 the engine untouched, and an unknown candidate total is never replaced by the
 observed set size (see the core-contract discussion in issue #2). Source
@@ -191,9 +202,13 @@ cat report.json | python cli_adapter.py - --quiet   # CI: no stdout, exit code o
 ```
 
 Argument parsing is strict: an unknown option, or a valued flag missing its
-value (e.g. `--audit-log` with no path), is a usage error (exit 2) — never a
+value (e.g. `--audit-log` with no path), is a usage error (exit 4) — never a
 silent fallback, because a silently dropped `--audit-log` or `--offline`
 would defeat the audit trail or trigger unexpected online verification.
+
+(`audit.py`, the original text-output CLI, keeps its simple `0`/`1`/`2` codes
+unchanged for backwards compatibility. The two-axis table above is the contract
+for the pipeline-facing adapter, `cli_adapter.py`.)
 
 
 ## Why "regenerate", not "annotate"
