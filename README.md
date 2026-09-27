@@ -70,6 +70,8 @@ Honesty rules baked in:
 - **A body that never arrived is not a success.** If HEAD answers but the GET fails (timeout, TLS, redirect loop), the verification degrades to `unknown` instead of inheriting the HEAD stage's success.
 - **A proxy is rejected, not silently trusted.** A configured proxy (explicit or from the environment) performs the DNS lookup itself, so address validation and the DNS-rebinding pin cannot run. Under the restricted default the verifier refuses that configuration with `proxy-policy-unsupported` rather than falling back to an unpinned opener; `allow_private_networks=True` is the explicit opt-in that accepts the weaker guarantee. Loopback and `NO_PROXY`-matched URLs never traverse an egress proxy and keep the pinned path.
 - **Hash drift is reported, not ignored.** Pass a recorded hash to detect silent content changes.
+- **Redirects stay within HTTP(S).** Every redirect target is checked before dispatch, including with private-network or proxy opt-in. FTP, file, data, and other schemes are policy-blocked, so redirects cannot escape the HTTP transport boundary.
+- **Intermediate bodies are discarded.** Redirect responses are closed without reading their bodies. The final response retains its size cap; relative URL resolution and redirect loop limits remain enforced.
 
 **`adapters/llm_wiki.py` — real adapter for [nashsu/llm_wiki](https://github.com/nashsu/llm_wiki) (18.9k★).** Grounded in that project's actual contract (`raw/sources/` → `wiki/{entities,concepts,sources,synthesis,comparisons}/`, YAML frontmatter with `sources[]`, `[[wikilink]]` cross-references), it verifies things arithmetic cannot:
 
