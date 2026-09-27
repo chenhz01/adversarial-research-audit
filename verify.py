@@ -21,6 +21,9 @@ every cross-host redirect hop is re-resolved and re-validated. Callers that
 legitimately need loopback/private targets must pass
 `allow_private_networks=True` explicitly — the restricted default never
 inherits silently.
+All redirect targets must remain HTTP(S), including when private networks or
+proxies are explicitly allowed. Intermediate redirect responses are closed
+without reading their bodies; only the final response is read, with a size cap.
 
 Proxy policy (restricted mode fails closed): a configured proxy — an explicit
 `proxy=` argument or any environment proxy that applies to the URL — takes DNS
@@ -49,6 +52,7 @@ import errno
 import functools
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -89,7 +93,7 @@ class TransportPolicy:
 
 
 class _PolicyBlocked(urllib.error.URLError):
-    """Raised when DNS records fail the transport policy (definite policy fact,
+    """Raised when a URL or DNS records fail the transport policy (definite policy fact,
     but NOT evidence about liveness — see `outcome == "blocked"`)."""
 
 
@@ -209,6 +213,30 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(conn, req, context=self._context)
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep every redirect in HTTP(S), without buffering intermediate bodies."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        # urllib normally drains fp.read() with no size limit before redirecting.
+        # Connections are not reused here, so discard the response immediately.
+        fp.close()
+        target = headers.get("location", headers.get("uri"))
+        if target is not None:
+            try:
+                scheme = urllib.parse.urlparse(target).scheme
+            except ValueError as exc:
+                raise urllib.error.URLError("invalid-redirect-url") from exc
+            if scheme not in ("", "http", "https"):
+                raise _PolicyBlocked(
+                    "policy-blocked: redirects must use HTTP(S)")
+        # Retain urllib's URL normalization, method rules and loop limits, but
+        # give its unconditional read an empty in-memory response.
+        with io.BytesIO() as empty:
+            return super().http_error_302(req, empty, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
 def _is_loopback(url: str) -> bool:
     try:
         host = urllib.parse.urlsplit(url).hostname or ""
@@ -248,7 +276,8 @@ def _build_opener(url: str, proxy: str | None,
     """
     if _is_loopback(url) or _no_proxy_match(url):
         return urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), http_handler, https_handler)
+            urllib.request.ProxyHandler({}), http_handler, https_handler,
+            _SafeRedirectHandler())
     env_proxies = urllib.request.getproxies()
     if proxy or env_proxies:
         if not allow_private_networks:
@@ -261,10 +290,12 @@ def _build_opener(url: str, proxy: str | None,
                 % (proxy, sorted(env_proxies) if not proxy else []))
         if proxy:
             return urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        return urllib.request.build_opener()
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                _SafeRedirectHandler())
+        return urllib.request.build_opener(_SafeRedirectHandler())
     return urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), http_handler, https_handler)
+        urllib.request.ProxyHandler({}), http_handler, https_handler,
+        _SafeRedirectHandler())
 
 
 def _proxy_rejection_text(exc: BaseException) -> str:
